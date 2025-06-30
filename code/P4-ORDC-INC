@@ -1,0 +1,2083 @@
+import random 
+import time
+import numpy as np
+from sklearn.cluster import KMeans
+from collections import defaultdict
+import pdb
+
+# import debugpy
+# debugpy.listen(5678)  # 监听端口 5678
+# print("Waiting for debugger to attach...")
+# debugpy.wait_for_client()  # 等待调试器连接
+
+
+class Job:
+    def __init__(self, job_type, node_count, config=None):
+        self.job_type = job_type
+        self.node_count = node_count
+        self.iterations = self._set_iterations(config)
+        self.stages = []
+        self.generate_stages(config)
+        self.job_key = None
+        self.allocated_node_ids = []
+    
+    def _set_iterations(self, config):
+        """Set number of iterations based on job type and config"""
+        if config and 'iterations' in config:
+            return config['iterations']
+        
+        if self.job_type == "DML":
+            # 典型DML任务迭代次数范围
+            return random.randint(1, 1)
+        return 1  # MapReduce默认1次迭代
+    
+    def _get_model_size(self):
+        """Generate realistic model sizes for DML tasks"""
+        # 常见深度学习模型大小范围(MB)
+        sizes = {
+            'small': (50, 50),    # 小型模型(如MobileNet)（50，100）
+            'medium': (200, 200),  # 中型模型(如ResNet50)（200，500）
+            'large': (800, 800)   # 大型模型(如BERT-Large)（800，1500）
+        }
+        model_type = random.choice(list(sizes.keys()))
+        min_size, max_size = sizes[model_type]
+        return random.randint(min_size, max_size)
+    
+    def _get_mapreduce_data_size(self):
+        """Generate realistic data sizes for MapReduce tasks"""
+        # 数据大小范围(MB)
+        sizes = {
+            'small': (1000, 1000),    # 1-2GB （1000，2000）
+            'medium': (3000, 3000),   # 3-5GB （3000，5000）
+            'large': (8000, 8000)    # 8-10GB （8000，10000）
+        }
+        data_type = random.choice(list(sizes.keys()))
+        min_size, max_size = sizes[data_type]
+        return random.randint(min_size, max_size)
+    
+    def _get_compute_time(self, stage_type):
+        """Generate realistic compute times based on stage type"""
+        if self.job_type == "DML":
+            if stage_type == "local_training":
+                # 本地训练时间范围(秒)
+                return random.randint(180, 180)  # 3-5分钟 （180，300）
+            
+        elif self.job_type == "MapReduce":
+            if stage_type == "map":
+                return random.randint(120, 120)  # 2-4分钟 （120，240）
+            elif stage_type == "shuffle":
+                return random.randint(60, 60)   # 1-2分钟 （60，120）
+            elif stage_type == "reduce":
+                return random.randint(90, 90)   # 1.5-3分钟 （90，180）
+                
+        return random.randint(60, 60)  # 默认1-2分钟 （60，120）
+    
+    def generate_stages(self, config=None):
+        if self.job_type == "DML":
+            model_size = self._get_model_size()  # MB
+            training_time = self._get_compute_time("local_training")
+            
+            self.stages = [
+                {"type": "compute", "name": "local training", "time": training_time},
+                {"type": "comm", "name": "push gradients", "data": model_size},
+                {"type": "compute", "name": "local training", "time": training_time * 0.8},  # 第二轮通常较快
+                {"type": "comm", "name": "pull weights", "data": model_size}
+            ]
+            
+        elif self.job_type == "MapReduce":
+            data_size = self._get_mapreduce_data_size()  # MB
+            
+            self.stages = [
+                {"type": "comm", "name": "map", "data": data_size},
+                {"type": "compute", "name": "local shuffle", "time": self._get_compute_time("shuffle")},
+                {"type": "comm", "name": "upload", "data": int(data_size * 0.4)},  # Reduce阶段数据通常更小
+                {"type": "compute", "name": "reduce", "time": self._get_compute_time("reduce")}
+            ]
+            #print(f"[DEBUG] Job {self.job_key} stages data: {[s['data'] for s in self.stages if s['type'] == 'comm']} MB")
+
+class OXCPortMapper:
+    def __init__(self, num_nodes, num_tors, ports_per_tor):
+        """Initialize OXC port mapper for 256×256 OXC switch
+        
+        Args:
+            num_nodes: Total number of compute nodes (256)
+            num_tors: Number of ToR switches (32)
+            ports_per_tor: Number of downlink ports per ToR (8)
+        """
+        self.num_nodes = num_nodes
+        self.num_tors = num_tors
+        self.ports_per_tor = ports_per_tor
+        
+        # Port ranges (1-256 for ToRs, 257-512 for nodes)
+        self.tor_port_start = 1
+        self.tor_port_end = num_tors * ports_per_tor  # 256
+        self.node_port_start = self.tor_port_end + 1  # 257
+        self.node_port_end = self.node_port_start + num_nodes - 1  # 512
+        
+        # Port mappings
+        self.tor_to_oxc_ports = {}  # {tor_id: [oxc_ports]}
+        self.node_to_oxc_port = {}  # {node_id: oxc_port}
+        self.oxc_port_mappings = {}  # {tor_port: node_port}
+        
+        self._initialize_port_mappings()
+        
+    def _initialize_port_mappings(self):
+        """Initialize OXC port mappings for 256×256 OXC"""
+        # Map ToR ports to OXC (ports 1-256)
+        for tor_id in range(1, self.num_tors + 1):
+            oxc_ports = []
+            for i in range(self.ports_per_tor):
+                oxc_port = (tor_id - 1) * self.ports_per_tor + i + 1
+                oxc_ports.append(oxc_port)
+            self.tor_to_oxc_ports[tor_id] = oxc_ports
+            
+        # Map nodes to OXC ports (ports 257-512)
+        for node_id in range(1, self.num_nodes + 1):
+            oxc_port = self.node_port_start + node_id - 1
+            self.node_to_oxc_port[node_id] = oxc_port
+
+    def create_connection(self, tor_id, node_id):
+        """Create a connection between ToR and node through OXC"""
+        if tor_id not in self.tor_to_oxc_ports or node_id not in self.node_to_oxc_port:
+            return None
+        
+        # Find available ToR port
+        available_ports = [p for p in self.tor_to_oxc_ports[tor_id] 
+                         if p not in self.oxc_port_mappings]
+        if not available_ports:
+            return None
+        
+        # Get node port
+        node_port = self.node_to_oxc_port[node_id]
+        if node_port in self.oxc_port_mappings.values():
+            return None
+        
+        # Create mapping
+        tor_port = available_ports[0]
+        self.oxc_port_mappings[tor_port] = node_port
+        return (tor_port, node_port)
+
+    def remove_connection(self, tor_port):
+        """Remove an OXC connection"""
+        if tor_port in self.oxc_port_mappings:
+            del self.oxc_port_mappings[tor_port]
+
+    def get_tor_connections(self, tor_id):
+        """Get all connections for a ToR"""
+        connections = []
+        for tor_port in self.tor_to_oxc_ports.get(tor_id, []):
+            if tor_port in self.oxc_port_mappings:
+                node_port = self.oxc_port_mappings[tor_port]
+                node_id = node_port - self.node_port_start + 1
+                connections.append((tor_port, node_port, node_id))
+        return connections
+
+    def get_node_connection(self, node_id):
+        """Get connection information for a node"""
+        node_port = self.node_to_oxc_port.get(node_id)
+        if node_port is None:
+            return None
+        
+        for tor_port, np in self.oxc_port_mappings.items():
+            if np == node_port:
+                tor_id = (tor_port - 1) // self.ports_per_tor + 1
+                return (tor_port, node_port, tor_id)
+        return None
+
+class JobMetrics:
+    def __init__(self):
+        self.jct = 0
+        self.idle_time = 0
+        self.resource_utilization = 0
+        self.communication_times = []
+        self.compute_times = []
+        self.group_total_time = 0
+
+class TPETimingStats:
+    def __init__(self):
+        self.event_times = {}  # {time_point: processing_duration}
+        self.total_time = 0
+        self.event_count = 0
+    
+    def add_event_time(self, time_point, duration):
+        self.event_times[time_point] = duration
+        self.total_time += duration
+        self.event_count += 1
+    
+    def get_average_time(self):
+        return self.total_time / self.event_count if self.event_count > 0 else 0
+
+def create_network_topology(tor_count, nodes_per_tor, ports_per_tor=8, num_nodes=256, over_subscription_ratio=2):
+    """Create network topology with OXC layer and Fat-Tree structure
+    Args:
+        tor_count: Number of ToR switches
+        nodes_per_tor: Maximum number of nodes per ToR
+        ports_per_tor: Number of downlink ports per ToR connecting to OXC
+        num_nodes: Total number of compute nodes
+        over_subscription_ratio: Over-subscription ratio (xp)
+    
+    Returns:
+        topology: Network topology structure
+        node_ids: Mapping from node names to IDs
+        agg_switches: List of aggregation switches
+        core_switches: List of core switches
+        oxc_mapper: OXC port mapper
+    """
+    # Calculate the number of aggregation and core switches
+    ports_per_agg_down = int(tor_count * (ports_per_tor / over_subscription_ratio) / tor_count)
+    ports_per_agg_up = int(ports_per_tor / over_subscription_ratio)
+    
+    # Create lists for aggregation and core switches
+    agg_switches = [f"Agg_{i}" for i in range(tor_count)]
+    core_switches = [f"Core_{i}" for i in range(tor_count)]
+    
+    # Initialize topology structure
+    topology = []
+    node_ids = {}
+    node_id = 1
+    nodes_per_rack = nodes_per_tor  # Each ToR connects to nodes_per_tor nodes via OXC
+    
+    # Initialize OXC mapper with correct parameters
+    oxc_mapper = OXCPortMapper(num_nodes=num_nodes, 
+                              num_tors=tor_count, 
+                              ports_per_tor=ports_per_tor)
+    
+    # Create pods and assign nodes to ToRs via OXC
+    pod_count = tor_count // 4  # Assuming 4 ToRs per pod as per Fat-Tree structure
+    for pod in range(pod_count):
+        pod_tors = []
+        for tor_in_pod in range(4):  # Each pod has 4 ToRs
+            tor_idx = pod * 4 + tor_in_pod
+            if tor_idx < tor_count:
+                rack = []
+                rack_node_count = min(nodes_per_rack, nodes_per_tor)
+                for node in range(rack_node_count):
+                    if node_id <= num_nodes:
+                        node_name = f"Node_{tor_idx}_{node}"
+                        rack.append(node_name)
+                        node_ids[node_name] = node_id
+                        node_id += 1
+                topology.append(rack)
+                pod_tors.append(tor_idx)
+    
+    return topology, node_ids, agg_switches, core_switches, oxc_mapper
+
+def allocate_nodes_to_job(job, topology, used_nodes, oxc_mapper):
+    """分配节点给任务，同时维护OXC连接
+    
+    Args:
+        job: 需要分配节点的任务
+        topology: 网络拓扑结构
+        used_nodes: 已使用的节点集合
+        oxc_mapper: OXC映射器
+        
+    Returns:
+        list: 分配给任务的节点列表
+    """
+    needed = job.node_count
+    if needed > 8:
+        raise ValueError(f"Job requires {needed} nodes, but maximum allowed is 8 nodes per job")
+    
+    # 按Pod分组ToR，更符合Fat-Tree结构
+    pod_count = len(topology) // 4  # 假设每个Pod有4个ToR
+    for pod in range(pod_count):
+        # 检查这个Pod中的所有ToR
+        pod_tors = topology[pod*4:(pod+1)*4]
+        available_nodes_in_pod = []
+        
+        # 收集Pod中所有可用节点
+        for rack in pod_tors:
+            available = [n for n in rack if n not in used_nodes]
+            available_nodes_in_pod.extend(available)
+        
+        # 如果这个Pod中有足够的节点
+        if len(available_nodes_in_pod) >= needed:
+            # 优先考虑来自同一个ToR的节点，以减少跨ToR通信
+            tor_to_nodes = {}
+            for node_name in available_nodes_in_pod:
+                tor_num = int(node_name.split('_')[1])
+                if tor_num not in tor_to_nodes:
+                    tor_to_nodes[tor_num] = []
+                tor_to_nodes[tor_num].append(node_name)
+            
+            # 按照每个ToR的可用节点数量排序，优先选择节点多的ToR
+            sorted_tors = sorted(tor_to_nodes.keys(), key=lambda x: len(tor_to_nodes[x]), reverse=True)
+            
+            selected_nodes = []
+            temp_connections = []
+            
+            # 从节点最多的ToR开始分配
+            for tor_id in sorted_tors:
+                if len(selected_nodes) >= needed:
+                    break
+                    
+                tor_nodes = tor_to_nodes[tor_id]
+                tor_id_for_oxc = tor_id + 1  # OXC使用从1开始的ToR ID
+                
+                for node_name in tor_nodes:
+                    if len(selected_nodes) >= needed:
+                        break
+                        
+                    tor_num, node_num = map(int, node_name.split('_')[1:])
+                    node_id = tor_num * 8 + node_num + 1  # 计算全局节点ID
+                    
+                    # 尝试创建OXC连接
+                    connection = oxc_mapper.create_connection(tor_id_for_oxc, node_id)
+                    if connection:
+                        selected_nodes.append(node_name)
+                        temp_connections.append((node_name, connection))
+                    else:
+                        # 如果无法创建连接，可能是OXC端口冲突
+                        print(f"Warning: Could not create OXC connection for node {node_name}")
+            
+            # 如果找到了足够的节点
+            if len(selected_nodes) == needed:
+                used_nodes.update(selected_nodes)
+                return selected_nodes
+            else:
+                # 如果没有足够节点，清理临时创建的连接
+                for _, (tor_port, _) in temp_connections:
+                    oxc_mapper.remove_connection(tor_port)
+    
+    # 如果按Pod分配失败，尝试全局分配
+    return fallback_allocate_nodes(job, topology, used_nodes, oxc_mapper)
+
+def fallback_allocate_nodes(job, topology, used_nodes, oxc_mapper):
+    """备用节点分配方法，在Pod分配失败时使用
+    
+    这个函数尝试在所有ToR中查找可用节点，不考虑Pod结构
+    """
+    needed = job.node_count
+    
+    for tor_id, rack in enumerate(topology, 1):
+        available = [n for n in rack if n not in used_nodes]
+        if len(available) >= needed:
+            selected_nodes = []
+            temp_connections = []
+            
+            # 尝试创建OXC连接
+            success = True
+            for node_name in available[:needed]:
+                tor_num, node_num = map(int, node_name.split('_')[1:])
+                node_id = tor_num * 8 + node_num + 1
+                
+                connection = oxc_mapper.create_connection(tor_id, node_id)
+                if connection:
+                    selected_nodes.append(node_name)
+                    temp_connections.append((node_name, connection))
+                else:
+                    for _, (tor_port, _) in temp_connections:
+                        oxc_mapper.remove_connection(tor_port)
+                    success = False
+                    break
+            
+            if success and len(selected_nodes) == needed:
+                used_nodes.update(selected_nodes)
+                return selected_nodes
+    
+    # 如果仍然无法分配足够节点，报错
+    available_nodes = sum(len([n for n in rack if n not in used_nodes]) for rack in topology)
+    raise ValueError(f"Not enough nodes available. Required: {needed}, Available: {available_nodes}")
+
+def print_network_state(topology, node_ids, oxc_mapper, agg_switches, core_switches, over_subscription_ratio):
+    """打印网络状态，包括OXC连接和Fat-Tree拓扑信息
+    
+    Args:
+        topology: 网络拓扑结构
+        node_ids: 节点ID映射
+        oxc_mapper: OXC端口映射器
+        agg_switches: 聚合交换机列表
+        core_switches: 核心交换机列表
+        over_subscription_ratio: 超额订阅比
+    """
+    print("\n============ 网络拓扑状态 ============")
+    
+    # 打印Fat-Tree拓扑概览
+    print("\n----- Fat-Tree拓扑概览 -----")
+    tor_count = len(topology)
+    agg_count = len(agg_switches)
+    core_count = len(core_switches)
+    node_count = sum(len(rack) for rack in topology)
+    
+    print(f"核心交换机 (Core): {core_count}")
+    print(f"聚合交换机 (Agg): {agg_count}")
+    print(f"接入交换机 (ToR): {tor_count}")
+    print(f"计算节点: {node_count}")
+    print(f"超额订阅比: {over_subscription_ratio}")
+    
+    # 计算链路信息
+    uplinks_per_tor = int(8 / over_subscription_ratio)  # 每个ToR的上行链路数量
+    downlinks_per_tor = 8  # 每个ToR的下行链路数量
+    
+    print(f"ToR上行链路数: {uplinks_per_tor} (连接到Agg)")
+    print(f"ToR下行链路数: {downlinks_per_tor} (连接到OXC)")
+    print(f"Agg下行链路数: {uplinks_per_tor} (连接到ToR)")
+    print(f"Agg上行链路数: {uplinks_per_tor} (连接到Core)")
+    
+    # 按Pod打印ToR信息
+    print("\n----- Pod结构 -----")
+    pod_count = tor_count // 4  # 假设每个Pod有4个ToR
+    for pod in range(pod_count):
+        pod_tors = range(pod*4, min((pod+1)*4, tor_count))
+        print(f"\nPod {pod+1}:")
+        print(f"  ToR交换机: {', '.join([f'ToR_{i+1}' for i in pod_tors])}")
+        print(f"  聚合交换机: {', '.join([agg_switches[i] for i in pod_tors])}")
+    
+    # 打印OXC连接信息
+    print("\n----- OXC连接信息 -----")
+    total_possible_connections = tor_count * 8  # 每个ToR有8个下行端口
+    active_connections = len(oxc_mapper.oxc_port_mappings)
+    print(f"OXC规模: 256×256")
+    print(f"活跃连接数: {active_connections}/{total_possible_connections}")
+    print(f"连接利用率: {(active_connections/total_possible_connections)*100:.2f}%")
+    
+    # 打印每个ToR的OXC连接详情
+    print("\n----- ToR到节点的OXC连接详情 -----")
+    for tor_id in range(1, tor_count + 1):
+        connections = oxc_mapper.get_tor_connections(tor_id)
+        if connections:
+            print(f"\nToR {tor_id}:")
+            print(f"  连接数: {len(connections)}/8")
+            print("  已连接节点:")
+            for tor_port, node_port, node_id in connections:
+                print(f"    - 节点 {node_id} (ToR端口 {tor_port} <-> OXC端口 {node_port})")
+        else:
+            print(f"\nToR {tor_id}: 无连接")
+    
+    # 打印网络资源利用情况
+    total_nodes = sum(len(rack) for rack in topology)
+    used_nodes = len(set(node_port for _, node_port, _ in 
+                        [conn for tor_id in range(1, tor_count + 1) 
+                         for conn in oxc_mapper.get_tor_connections(tor_id)]))
+    
+    print("\n----- 资源利用情况 -----")
+    print(f"已分配节点: {used_nodes}/{total_nodes}")
+    print(f"节点利用率: {(used_nodes/total_nodes)*100:.2f}%")
+    print(f"OXC端口利用率: {(active_connections/(tor_count*8 + total_nodes))*100:.2f}%")
+    
+    print("\n============ 网络拓扑状态结束 ============")
+
+def compute_times(job):
+    return [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+
+def all_compute_times_in_group(group):
+    return [compute_times(job) for job in group]
+
+def check_group_constraints(group):
+    if len(group) < 2:
+        # 一个Job的group也可认为满足，不进行严格约束
+        return True
+    all_times = [t for job in group for t in compute_times(job)]
+    max_time = max(all_times)
+    min_time = min(all_times)
+    threshold = (max_time - min_time) / 2 if (max_time - min_time) > 5 else 5
+
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            times_i = compute_times(group[i])
+            times_j = compute_times(group[j])
+            for ci, cj in zip(times_i, times_j):
+                if abs(ci - cj) > threshold:
+                    return False
+
+    times_matrix = all_compute_times_in_group(group)
+    first_phase_times = [t[0] for t in times_matrix]
+    second_phase_times = [t[1] for t in times_matrix if len(t) > 1]
+
+    # 当只有一个Job时，这里无需检查重复，因为只有一个元素
+    if len(group) > 1:
+        if len(set(first_phase_times)) < len(first_phase_times):
+            return False
+        if len(second_phase_times) > 0 and len(set(second_phase_times)) < len(second_phase_times):
+            return False
+
+    return True
+
+#     return grouped_jobs
+
+def cluster_jobs(jobs, K):
+    print("\n===== 开始任务分组 =====")
+    print(f"输入任务: {[job.job_key for job in jobs]}")
+    print(f"期望分组数: {K}")
+    """Cluster jobs with empty group handling"""
+    if K > len(jobs):
+        K = len(jobs)  # 限制K不超过jobs数量
+        print(f"Warning: Reducing K to {K} as it cannot exceed number of jobs")
+    
+    features = []
+    for job in jobs:
+        cts = compute_times(job)
+        if len(cts) < 2:
+            cts += [0]*(2 - len(cts))
+        features.append(cts[:2])
+
+    print(f"提取的特征: {features}")
+
+    X = np.array(features)
+    kmeans = KMeans(n_clusters=K, random_state=0, n_init='auto')
+    labels = kmeans.fit_predict(X)
+
+    print(f"KMeans 分配标签: {labels}")
+
+    # 初始化分组列表
+    grouped_jobs = [[] for _ in range(K)]
+    
+    # 将jobs分配到对应的组
+    for job, label in zip(jobs, labels):
+        grouped_jobs[label].append(job)
+    
+    # 移除空组
+    grouped_jobs = [group for group in grouped_jobs if len(group) > 0]
+    
+    # 检查组约束
+    for i, group in enumerate(grouped_jobs):
+        if not check_group_constraints(group):
+            print(f"Warning: Group {i+1} does not meet the constraints. Consider adjusting.")
+    
+    print(f"Created {len(grouped_jobs)} non-empty groups")
+
+    for i, group in enumerate(grouped_jobs):
+        print(f"Group {i+1}: {[job.job_key for job in group]}")
+    return grouped_jobs
+
+# # def calculate_ct_ratio(job, bandwidth=10e9):
+# #     """计算任务的计算/通信（C/T）比率"""
+# #     compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+# #     comm_data = [stage['data'] for stage in job.stages if stage['type'] == 'comm']
+    
+# #     # 计算总计算时间
+# #     total_compute_time = sum(compute_times)
+    
+# #     # 根据数据大小和带宽计算总通信时间
+# #     total_comm_time = sum(data / bandwidth for data in comm_data)
+    
+# #     # 避免除以零
+# #     if total_comm_time == 0:
+# #         return float('inf')  # 如果没有通信，返回无穷大
+    
+#     return total_compute_time / total_comm_time
+
+def calculate_ct_ratio(job):
+    """计算任务的计算/通信比率（计算时间/通信数据量）"""
+    compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+    comm_data = [stage['data'] for stage in job.stages if stage['type'] == 'comm']
+    
+    # 计算总计算时间
+    total_compute_time = sum(compute_times)
+    
+    # 计算总通信数据量（MB）
+    total_comm_data = sum(comm_data)
+    
+    print(f"[DEBUG] C/T calculation for {job.job_key}:")
+    print(f"[DEBUG]   Compute times: {compute_times}, sum: {total_compute_time}")
+    print(f"[DEBUG]   Comm data: {comm_data}, sum: {total_comm_data}")
+    
+    # 避免除以零
+    if total_comm_data == 0:
+        print(f"[DEBUG]   C/T Ratio: Infinite (no communication data)")
+        return float('inf')  # 如果没有通信数据，返回无穷大
+    
+    # 返回计算时间/通信数据量比率
+    ct_ratio = total_compute_time / total_comm_data
+    print(f"[DEBUG]   C/T Ratio: {ct_ratio}")
+    return ct_ratio
+
+def optimize_batches_by_ct_ratio(group):
+    """基于C/T比优化批次分配"""
+    if len(group) <= 1:
+        return group, []  # 单个任务无法分割
+    
+    # 计算每个任务的C/T比
+    job_ratios = [(job, calculate_ct_ratio(job)) for job in group]
+    
+    # 按C/T比排序（降序）
+    job_ratios.sort(key=lambda x: x[1], reverse=True)
+    
+    # 在批次之间分配任务以平衡工作负载
+    batch1 = []
+    batch2 = []
+    batch1_compute = 0 #时间
+    batch2_compute = 0
+    batch1_comm = 0
+    batch2_comm = 0
+    
+    for job, ratio in job_ratios:
+        compute_time = sum(stage['time'] for stage in job.stages if stage['type'] == 'compute')
+        comm_data = sum(stage['data'] for stage in job.stages if stage['type'] == 'comm')
+        comm_time = comm_data / 10e9  # 假设10 Gbps带宽
+        
+        # 将任务添加到当前总工作量较少的批次
+        if (batch1_compute + batch1_comm) <= (batch2_compute + batch2_comm):
+            batch1.append(job)
+            batch1_compute += compute_time
+            batch1_comm += comm_time
+        else:
+            batch2.append(job)
+            batch2_compute += compute_time
+            batch2_comm += comm_time
+    
+    # 确保两个批次对于较大的组是平衡的
+    if len(group) >= 4 and (len(batch1) == 0 or len(batch2) == 0):
+        # 如果不平衡，手动重新分配
+        all_jobs = batch1 + batch2
+        half = len(all_jobs) // 2
+        return all_jobs[:half], all_jobs[half:]
+    
+    return batch1, batch2
+
+
+
+# 保留原始函数以便比较
+def calculate_group_stages_original(group):
+    """原始组阶段计算，使用基于CT比率的批次分配"""
+    if len(group) == 1:
+        batch1 = group
+        batch2 = []
+        job = group[0]
+        
+        def calculate_accelerated_times(job):
+            compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+            comm_times = [stage['data'] / 10e9 for stage in job.stages if stage['type'] == 'comm']
+            
+            # 根据节点数（1/N）应用INC加速
+            N = job.node_count
+            acceleration_factor = 1 if N > 1 else 1
+            
+            # 对于DML任务：加速第二计算阶段和第二通信
+            if job.job_type == "DML":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            
+            # 对于MapReduce任务：加速reduce阶段和upload阶段
+            elif job.job_type == "MapReduce":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            
+            return compute_times, comm_times
+        
+        compute_t, comm_t = calculate_accelerated_times(job)
+        
+        phase1_time = compute_t[0] if compute_t else 0
+        phase2_time = comm_t[0] if comm_t else 0
+        phase3_time = compute_t[1] if len(compute_t) > 1 else 0
+        phase4_time = comm_t[1] if len(comm_t) > 1 else 0
+        
+        return [phase1_time, phase2_time, phase3_time, phase4_time], batch1, batch2
+
+    # 组大小 > 1
+    # 使用原始C/T比率为基础的分配策略
+    batch1, batch2 = optimize_batches_by_ct_ratio(group)
+    
+    def calculate_batch_times(batch):
+        max_compute_times = []
+        max_comm_times = []
+        
+        for job in batch:
+            compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+            comm_times = [stage['data'] / 10e9 for stage in job.stages if stage['type'] == 'comm']
+            
+            # 应用INC加速(1/N)
+            N = job.node_count
+            acceleration_factor = 1 if N > 1 else 1
+            
+            if job.job_type == "DML":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            elif job.job_type == "MapReduce":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            
+            # 更新最大时间
+            for i, t in enumerate(compute_times):
+                if i >= len(max_compute_times):
+                    max_compute_times.append(t)
+                else:
+                    max_compute_times[i] = max(max_compute_times[i], t)
+                    
+            for i, t in enumerate(comm_times):
+                if i >= len(max_comm_times):
+                    max_comm_times.append(t)
+                else:
+                    max_comm_times[i] = max(max_comm_times[i], t)
+                    
+        return max_compute_times, max_comm_times
+
+    # 计算批次时间
+    batch1_compute, batch1_comm = calculate_batch_times(batch1)
+    batch2_compute, batch2_comm = calculate_batch_times(batch2)
+
+    # 计算最终阶段时间
+    phase1_time = max(batch1_compute[0] if batch1_compute else 0, 
+                     batch1_comm[0] if batch1_comm else 0)
+    phase2_time = max(batch2_compute[0] if batch2_compute else 0,
+                     batch2_comm[0] if batch2_comm else 0)
+    phase3_time = max(batch1_compute[1] if len(batch1_compute) > 1 else 0,
+                     batch1_comm[1] if len(batch1_comm) > 1 else 0)
+    phase4_time = max(batch2_compute[1] if len(batch2_compute) > 1 else 0,
+                     batch2_comm[1] if len(batch2_comm) > 1 else 0)
+
+    return [phase1_time, phase2_time, phase3_time, phase4_time], batch1, batch2
+
+# 新的优化版本
+def calculate_group_stages(group):
+    """增强的组阶段计算，使用爬山优化进行批次分配"""
+    if len(group) == 1:
+        batch1 = group
+        batch2 = []
+        job = group[0]
+        
+        def calculate_accelerated_times(job):
+            compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+            comm_times = [stage['data'] / 10e9 for stage in job.stages if stage['type'] == 'comm']
+            
+            # 基于节点数应用INC加速
+            N = job.node_count
+            acceleration_factor = 1 if N > 1 else 1
+            
+            # 对于DML任务：加速第二计算阶段和第二通信
+            if job.job_type == "DML":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            
+            # 对于MapReduce任务：加速reduce阶段和upload阶段
+            elif job.job_type == "MapReduce":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            
+            return compute_times, comm_times
+        
+        compute_t, comm_t = calculate_accelerated_times(job)
+        
+        phase1_time = compute_t[0] if compute_t else 0
+        phase2_time = comm_t[0] if comm_t else 0
+        phase3_time = compute_t[1] if len(compute_t) > 1 else 0
+        phase4_time = comm_t[1] if len(comm_t) > 1 else 0
+        
+        return [phase1_time, phase2_time, phase3_time, phase4_time], batch1, batch2
+
+    # 组大小 > 1
+    # 使用爬山策略进行批次优化
+    print("使用爬山算法优化批次分配...")
+    batch1, batch2 = optimize_batches_hill_climbing(group)
+    
+    # 使用优化的分配计算批次时间
+    batch1_compute, batch1_comm = calculate_batch_times(batch1)
+    batch2_compute, batch2_comm = calculate_batch_times(batch2)
+
+    # 计算最终阶段时间
+    phase1_time = max(batch1_compute[0] if batch1_compute else 0, 
+                     batch1_comm[0] if batch1_comm else 0)
+    phase2_time = max(batch2_compute[0] if batch2_compute else 0,
+                     batch2_comm[0] if batch2_comm else 0)
+    phase3_time = max(batch1_compute[1] if len(batch1_compute) > 1 else 0,
+                     batch1_comm[1] if len(batch1_comm) > 1 else 0)
+    phase4_time = max(batch2_compute[1] if len(batch2_compute) > 1 else 0,
+                     batch2_comm[1] if len(batch2_comm) > 1 else 0)
+
+    return [phase1_time, phase2_time, phase3_time, phase4_time], batch1, batch2
+
+def calculate_group_timeline(phases):
+    """Generate timeline array for a group based on its phases"""
+    timeline = [0]  # Start with 0
+    current_time = 0
+    for phase in phases:
+        current_time += phase
+        timeline.append(round(current_time, 2))
+    return timeline
+
+# def repeat_phases_for_iterations(phases, max_iter):
+#     return phases * max_iter
+
+def calculate_jct(job):
+    compute_times_sum = sum(stage['time'] for stage in job.stages if stage['type'] == 'compute')
+    comm_time = 0
+    return compute_times_sum + comm_time
+
+def compute_timeline(phases):
+    return []
+
+def get_comm_stages(job):
+    if job.job_type == "DML":
+        return job.stages[1], job.stages[3]
+    else:
+        return job.stages[0], job.stages[2]
+
+def get_comm_event_jobs(jobs_list, communication_stage):
+    events = []
+    for jb in jobs_list:
+        comm_stages = [s for s in jb.stages if s['type'] == 'comm']
+        if len(comm_stages) >= communication_stage:
+            comm_stage = comm_stages[communication_stage - 1]
+            events.append({
+                "job_key": jb.job_key,
+                "data": comm_stage['data'],
+                "node_ids": jb.allocated_node_ids
+            })
+    return events
+
+def assign_jobs_to_switches(communicating_jobs, job_allocations, pdp_switch_count, normal_switch_count, nodes_per_tor, bandwidth):
+    """
+    Assign jobs to switches ensuring all nodes of a job are assigned to the same switch
+    
+    Args:
+        communicating_jobs: List of jobs that need to communicate
+        job_allocations: Dict containing job allocation information
+        pdp_switch_count: Number of PDP switches
+        normal_switch_count: Number of normal switches
+        nodes_per_tor: Maximum nodes per switch
+        bandwidth: Network bandwidth
+    
+    Returns:
+        tuple: (pdp_matrix, normal_matrix, job_tor_map)
+    """
+    # Sort jobs based on data size in descending order
+    batch2_jobs_sorted = sorted(communicating_jobs, key=lambda j: j['data'], reverse=True)
+
+    # Get maximum node ID for matrix dimensions
+    all_node_ids = []
+    for j in job_allocations.values():
+        all_node_ids.extend(j['allocated_node_ids'])
+    N = max(all_node_ids)
+
+    # Initialize matrices and capacity trackers
+    pdp_matrix = np.zeros((N, pdp_switch_count), dtype=int)
+    normal_matrix = np.zeros((N, normal_switch_count), dtype=int)
+    pdp_switch_capacity = [0] * pdp_switch_count
+    normal_switch_capacity = [0] * normal_switch_count
+    
+    # Track switch assignments
+    job_tor_map = {}
+    node_to_switch_map = {}  # Keep track of which switch each node is assigned to
+
+    for job_info in batch2_jobs_sorted:
+        job_key = job_info['job_key']
+        node_ids_for_job = job_info['node_ids']
+        comm_data = job_info['data']
+        assigned = False
+
+        # Check if any nodes are already assigned to a switch
+        existing_switches = set()
+        for node_id in node_ids_for_job:
+            if node_id in node_to_switch_map:
+                existing_switches.add(node_to_switch_map[node_id])
+
+        if len(existing_switches) > 1:
+            raise ValueError(f"Job {job_key} has nodes spread across multiple switches: {existing_switches}")
+        elif len(existing_switches) == 1:
+            # Job already has nodes assigned to a switch, use that switch
+            switch_info = list(existing_switches)[0]
+            if switch_info.startswith("PDP"):
+                switch_idx = int(switch_info.split("_")[1])
+                if pdp_switch_capacity[switch_idx] + len(node_ids_for_job) <= nodes_per_tor:
+                    for nid in node_ids_for_job:
+                        if nid not in node_to_switch_map:
+                            pdp_matrix[nid - 1, switch_idx] = 1
+                            node_to_switch_map[nid] = f"PDP_{switch_idx}"
+                    pdp_switch_capacity[switch_idx] += len(node_ids_for_job)
+                    job_tor_map[job_key] = f"ToR_{switch_idx + 1}(PDP)"
+                    assigned = True
+            else:
+                switch_idx = int(switch_info.split("_")[1])
+                if normal_switch_capacity[switch_idx] + len(node_ids_for_job) <= nodes_per_tor:
+                    for nid in node_ids_for_job:
+                        if nid not in node_to_switch_map:
+                            normal_matrix[nid - 1, switch_idx] = 1
+                            node_to_switch_map[nid] = f"Normal_{switch_idx}"
+                    normal_switch_capacity[switch_idx] += len(node_ids_for_job)
+                    job_tor_map[job_key] = f"ToR_{pdp_switch_count + switch_idx + 1}(Normal)"
+                    assigned = True
+
+        if not assigned:
+            # Try to assign to a new PDP switch
+            for i in range(pdp_switch_count):
+                if pdp_switch_capacity[i] + len(node_ids_for_job) <= nodes_per_tor:
+                    # Ensure all nodes can fit on this switch
+                    can_assign = True
+                    for nid in node_ids_for_job:
+                        if nid in node_to_switch_map and node_to_switch_map[nid] != f"PDP_{i}":
+                            can_assign = False
+                            break
+                    
+                    if can_assign:
+                        for nid in node_ids_for_job:
+                            pdp_matrix[nid - 1, i] = 1
+                            node_to_switch_map[nid] = f"PDP_{i}"
+                        pdp_switch_capacity[i] += len(node_ids_for_job)
+                        job_tor_map[job_key] = f"ToR_{i + 1}(PDP)"
+                        assigned = True
+                        break
+
+        # If still not assigned, try normal switches
+        if not assigned:
+            for i in range(normal_switch_count):
+                if normal_switch_capacity[i] + len(node_ids_for_job) <= nodes_per_tor:
+                    # Ensure all nodes can fit on this switch
+                    can_assign = True
+                    for nid in node_ids_for_job:
+                        if nid in node_to_switch_map and node_to_switch_map[nid] != f"Normal_{i}":
+                            can_assign = False
+                            break
+                    
+                    if can_assign:
+                        for nid in node_ids_for_job:
+                            normal_matrix[nid - 1, i] = 1
+                            node_to_switch_map[nid] = f"Normal_{i}"
+                        normal_switch_capacity[i] += len(node_ids_for_job)
+                        job_tor_map[job_key] = f"ToR_{pdp_switch_count + i + 1}(Normal)"
+                        assigned = True
+                        break
+
+        if not assigned:
+            raise ValueError(f"Failed to assign Job {job_key} to any switch. Nodes: {node_ids_for_job}")
+
+        # Calculate and print communication time
+        communication_time = comm_data / (bandwidth / 1e9)
+        print(f"Job {job_key} assigned to {job_tor_map[job_key]}. "
+              f"Comm Data={comm_data}, Communication Time={communication_time:.2f}秒")
+
+    return pdp_matrix, normal_matrix, job_tor_map
+
+def adjust_job_metrics(job, metrics):
+    """
+    Adjust job metrics to account for INC acceleration (1/N)
+    """
+    N = job.node_count
+    #acceleration_factor = 1/N if N > 1 else 1
+    acceleration_factor = 1 if N > 1 else 1
+    
+    # Adjust compute times and communication times based on job type
+    if job.job_type == "DML":
+        if len(metrics.compute_times) > 1:
+            metrics.compute_times[1] *= acceleration_factor
+        if len(metrics.communication_times) > 1:
+            metrics.communication_times[1] *= acceleration_factor
+    elif job.job_type == "MapReduce":
+        if len(metrics.compute_times) > 1:
+            metrics.compute_times[1] *= acceleration_factor
+        if len(metrics.communication_times) > 1:
+            metrics.communication_times[1] *= acceleration_factor
+    
+    # Recalculate JCT
+    metrics.jct = sum(metrics.compute_times) + sum(metrics.communication_times)
+    
+    # Update idle time and resource utilization
+    metrics.idle_time = metrics.group_total_time - metrics.jct
+    metrics.resource_utilization = (
+        (metrics.group_total_time - metrics.idle_time) / metrics.group_total_time
+    ) * 100
+    
+    return metrics
+
+def repeat_phases_for_iterations(base_phases, group, job_allocations, max_iter):
+    """重新计算多迭代的相位时间，考虑活跃任务"""
+    repeated_phases = []
+    
+    # 第一次迭代的批次划分（已经完成）
+    if len(group) > 1:
+        half = len(group) // 2
+        first_batch1 = group[:half]
+        first_batch2 = group[half:]
+    else:
+        first_batch1 = group
+        first_batch2 = []
+    
+    
+    # 添加第一次迭代的相位
+    repeated_phases.extend(base_phases)
+    
+    # 计算后续迭代的相位
+    for i in range(1, max_iter):
+        # 筛选这次迭代中的活跃任务
+        active_batch1 = [job for job in first_batch1 
+                        if i < (job_allocations[job.job_key]['iterations'] 
+                               if job_allocations[job.job_key]['job_type'] == "DML" else 1)]
+        
+        active_batch2 = [job for job in first_batch2 
+                        if i < (job_allocations[job.job_key]['iterations'] 
+                               if job_allocations[job.job_key]['job_type'] == "DML" else 1)]
+        
+        # 根据活跃任务重新计算相位时间
+        iter_phases = calculate_iteration_phases(active_batch1, active_batch2)
+        repeated_phases.extend(iter_phases)
+    
+    return repeated_phases
+
+def calculate_iteration_phases(batch1, batch2):
+    """计算特定迭代的相位时间"""
+    def calculate_batch_times(batch):
+        if not batch:  # 如果批次为空，返回空列表
+            return [], []
+            
+        max_compute_times = []
+        max_comm_times = []
+        
+        for job in batch:
+            compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+            comm_times = [stage['data'] / 10e9 for stage in job.stages if stage['type'] == 'comm']
+            
+            # Apply INC acceleration (1/N)
+            N = job.node_count
+            acceleration_factor = 1 if N > 1 else 1
+            
+            if job.job_type == "DML":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            elif job.job_type == "MapReduce":
+                if len(compute_times) > 1:
+                    compute_times[1] *= acceleration_factor
+                if len(comm_times) > 1:
+                    comm_times[1] *= acceleration_factor
+            
+            # Update max times
+            for i, t in enumerate(compute_times):
+                if i >= len(max_compute_times):
+                    max_compute_times.append(t)
+                else:
+                    max_compute_times[i] = max(max_compute_times[i], t)
+                    
+            for i, t in enumerate(comm_times):
+                if i >= len(max_comm_times):
+                    max_comm_times.append(t)
+                else:
+                    max_comm_times[i] = max(max_comm_times[i], t)
+                    
+        return max_compute_times, max_comm_times
+
+    # 计算两个批次的时间
+    batch1_compute, batch1_comm = calculate_batch_times(batch1)
+    batch2_compute, batch2_comm = calculate_batch_times(batch2)
+
+    # 计算最终相位时间
+    phase1_time = max(batch1_compute[0] if batch1_compute else 0, 
+                     batch1_comm[0] if batch1_comm else 0)
+    phase2_time = max(batch2_compute[0] if batch2_compute else 0,
+                     batch2_comm[0] if batch2_comm else 0)
+    phase3_time = max(batch1_compute[1] if len(batch1_compute) > 1 else 0,
+                     batch1_comm[1] if len(batch1_comm) > 1 else 0)
+    phase4_time = max(batch2_compute[1] if len(batch2_compute) > 1 else 0,
+                     batch2_comm[1] if len(batch2_comm) > 1 else 0)
+
+    return [phase1_time, phase2_time, phase3_time, phase4_time]
+
+def perform_TPE_for_time(all_comm_events, desired_time, job_allocations, pdp_switch_count, normal_switch_count, nodes_per_tor, bandwidth):
+    communicating_jobs = []
+    target_events = []
+    
+    for evt in all_comm_events:
+        if abs(evt["time"] - desired_time) < 0.001:
+            target_events.append(evt)
+            for job_info in evt["jobs"]:
+                communicating_jobs.append(job_info)
+
+    if not communicating_jobs:
+        return None
+
+    communicating_jobs.sort(key=lambda x: x['data'], reverse=True)
+
+    pdp_matrix, normal_matrix, job_tor_map = assign_jobs_to_switches(
+        communicating_jobs, job_allocations, pdp_switch_count, normal_switch_count, nodes_per_tor, bandwidth
+    )
+
+    # Print assignments
+    print(f"\nTPE Results at Time {desired_time:.2f}:")
+    for job_key, tor_info in job_tor_map.items():
+        nodes = job_allocations[job_key]['allocated_node_ids']
+        print(f"{job_key} - {tor_info} - Nodes: {nodes}")
+
+    job_comm_times = {}
+    max_comm_time = 0
+    for job_info in communicating_jobs:
+        comm_time = job_info["data"] / (bandwidth / 1e9)
+        job_comm_times[job_info["job_key"]] = comm_time
+        max_comm_time = max(max_comm_time, comm_time)
+
+    return pdp_matrix, normal_matrix, job_tor_map, max_comm_time, target_events, job_comm_times
+
+def generate_comm_events_for_group(group, phases, batch1, batch2, job_allocations, group_id):
+    """生成具有正确相位交替和时间的通信事件"""
+    current_time = 0
+    all_events = []
+    base_phase_length = 4  # 每次迭代的相位数
+    
+    # 跟踪需要的最大迭代次数
+    max_iter = max([job_allocations[job.job_key]['iterations'] 
+                   if job_allocations[job.job_key]['job_type'] == "DML" else 1 
+                   for job in group])
+
+    for iteration in range(max_iter):
+        # 在此迭代中筛选每个批次的活动任务
+        active_batch1 = [job for job in batch1 
+                         if iteration < (job_allocations[job.job_key]['iterations'] 
+                                        if job_allocations[job.job_key]['job_type'] == "DML" else 1)]
+        
+        active_batch2 = [job for job in batch2 
+                         if iteration < (job_allocations[job.job_key]['iterations'] 
+                                        if job_allocations[job.job_key]['job_type'] == "DML" else 1)]
+        
+        for phase_index in range(base_phase_length):
+            actual_index = phase_index + iteration * base_phase_length
+            
+            if phase_index % 2 == 0:
+                comm_jobs = get_comm_event_jobs(active_batch2, (phase_index // 2) + 1)
+            else:
+                comm_jobs = get_comm_event_jobs(active_batch1, (phase_index // 2) + 1)
+
+            if comm_jobs:
+                # 根据已完成的相位计算当前时间
+                current_time = sum(phases[:actual_index])
+                
+                all_events.append({
+                    "time": round(current_time, 2),
+                    "group": group_id,
+                    "event_index": actual_index,
+                    "jobs": comm_jobs,
+                    "iteration": iteration,
+                    "phase_in_iteration": phase_index
+                })
+
+    return all_events, []
+
+def recalculate_times(all_comm_events, group_info):
+    """
+    Recalculate event times based on updated phases
+    """
+    for event in sorted(all_comm_events, key=lambda x: (x["group"], x["event_index"])):
+        group_id = event["group"]
+        event_index = event["event_index"]
+        phases = group_info[group_id]["phases"]
+        event["time"] = sum(phases[:event_index + 1])
+
+def recalculate_event_times(all_comm_events, group_info):
+    """Recalculate communication event times with correct iteration handling"""
+    for event in all_comm_events:
+        group_id = event["group"]
+        event_index = event["event_index"]
+        iteration = event["iteration"]
+        phase_in_iteration = event["phase_in_iteration"]
+        phases = group_info[group_id]["phases"]
+        
+        # Calculate time based on completed iterations and phases within current iteration
+        completed_iterations = iteration * len(phases[:4])  # Base phases per iteration is 4
+        current_iteration_phases = phases[phase_in_iteration:phase_in_iteration+1]
+        
+        # Time is sum of all completed iteration phases plus phases in current iteration
+        total_time = sum(phases[:completed_iterations]) + sum(current_iteration_phases)
+        event["time"] = round(total_time, 2)
+
+def update_phases_with_comm_times(group_info, event, max_comm_time, job_comm_times):
+    """
+    Update phases based on communication times for each group
+    """
+    group_id = event["group"]
+    event_index = event["event_index"]
+    phases = group_info[group_id]["phases"]
+    phase_index = event_index % len(phases)
+    
+    # Update phase time if communication time is larger
+    if max_comm_time > phases[phase_index]:
+        phases[phase_index] = max_comm_time
+        print(f"Updated Group {group_id} Phase {phase_index} from {phases[phase_index]} to {max_comm_time:.2f}")
+        
+    return phases
+
+def get_compute_time_for_phase(job, phase_index):
+    """Get the appropriate compute time based on phase index"""
+    compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+    if phase_index in [0, 1]:  # First compute phase
+        return compute_times[0] if compute_times else 0
+    else:  # Second compute phase
+        return compute_times[1] if len(compute_times) > 1 else 0
+
+def get_comm_data_for_phase(job, phase_index):
+    """Get the appropriate communication data based on phase index"""
+    comm_stages = [stage['data'] for stage in job.stages if stage['type'] == 'comm']
+    if phase_index in [0, 1]:  # First communication phase
+        return comm_stages[0] if comm_stages else 0
+    else:  # Second communication phase
+        return comm_stages[1] if len(comm_stages) > 1 else 0
+
+def calculate_phase_time(computing_batch, communicating_batch, phase_index, bandwidth=10e9):
+    """Calculate phase time based on compute and communication times"""
+    # Get max compute time for computing batch
+    max_compute_time = max(
+        [get_compute_time_for_phase(job, phase_index) for job in computing_batch]
+        or [0]
+    )
+    
+    # Get max communication time for communicating batch
+    comm_data = max(
+        [get_comm_data_for_phase(job, phase_index) for job in communicating_batch]
+        or [0]
+    )
+    max_comm_time = comm_data / (bandwidth / 1e9) if comm_data > 0 else 0
+    
+    # Return the maximum of compute and communication times
+    return max(max_compute_time, max_comm_time)
+
+def calculate_job_metrics(job_key, job_info, group_info, group_id, job_comm_times):
+    """Calculate JCT and resource utilization for a job"""
+    metrics = JobMetrics()
+
+    # 打印原始值
+    print(f"[DEBUG] {job_key} original stages: {job_info['stages']}")
+    print(f"[DEBUG] {job_key} job_comm_times: {job_comm_times.get(job_key, {})}")
+    
+    # Get number of iterations for the job
+    iterations = job_info.get("iterations", 1)
+    
+    # Calculate compute times across all iterations
+    base_compute_times = [s['time'] for s in job_info['stages'] if s['type'] == 'compute']
+    metrics.compute_times = base_compute_times * iterations
+    metrics.jct = sum(metrics.compute_times)
+    
+    # Add communication times from TPE results
+    comm_phases = []
+    if job_key in job_comm_times:
+        for phase_idx, comm_time in job_comm_times[job_key].items():
+            metrics.communication_times.append(comm_time)
+            metrics.jct += comm_time
+            comm_phases.append(phase_idx)
+    
+    # Get group total time
+    group_phases = group_info[group_id]["phases"]
+    metrics.group_total_time = sum(group_phases)
+    
+    # Calculate idle time and resource utilization
+    metrics.idle_time = metrics.group_total_time - metrics.jct
+    metrics.resource_utilization = ((metrics.group_total_time - metrics.idle_time) / 
+                                  metrics.group_total_time) * 100
+    
+    return metrics
+
+def calculate_average_metrics(job_allocations, updated_group_info, job_comm_times):
+    """Calculate average metrics across all jobs"""
+    total_jct = 0
+    total_resource_util = 0
+    job_count = 0
+    job_metrics = []  # Store individual job metrics for detailed analysis
+
+    for job_key, job_info in job_allocations.items():
+        group_id = None
+        # Find which group the job belongs to
+        for g_id, g_info in updated_group_info.items():
+            if any(j.job_key == job_key for j in g_info["batch1"] + g_info["batch2"]):
+                group_id = g_id
+                break
+        
+        if group_id:
+            metrics = calculate_job_metrics(
+                job_key, job_info, updated_group_info, group_id, job_comm_times
+            )
+            total_jct += metrics.jct
+            total_resource_util += metrics.resource_utilization
+            job_count += 1
+            job_metrics.append((job_key, metrics))
+
+    if job_count > 0:
+        avg_jct = total_jct / job_count
+        avg_resource_util = total_resource_util / job_count
+        return avg_jct, avg_resource_util, job_metrics
+    return 0, 0, []
+
+def process_TPE_sequence(all_comm_events, job_allocations, group_info):
+    """Process TPE sequence with updated phase calculation rules and timeline generation"""
+    sorted_events = sorted(all_comm_events, key=lambda x: (x["time"], x["group"], x["event_index"]))
+    
+    for group_id, info in group_info.items():
+        batch1 = info["batch1"]
+        batch2 = info["batch2"]
+        base_phase_length = 4
+        max_iter = info.get("iterations", 1)
+        
+        # Calculate phases for all iterations
+        new_phases = []
+        for iteration in range(max_iter):
+            phase1_time = calculate_phase_time(batch1, batch2, 0)
+            phase2_time = calculate_phase_time(batch2, batch1, 1)
+            phase3_time = calculate_phase_time(batch1, batch2, 2)
+            phase4_time = calculate_phase_time(batch2, batch1, 3)
+            new_phases.extend([phase1_time, phase2_time, phase3_time, phase4_time])
+        
+        # Update phases and generate timeline
+        if new_phases != info["phases"]:
+            print(f"\nUpdating Group {group_id} phases:")
+            print(f"Old phases: {[round(p, 2) for p in info['phases']]}")
+            print(f"New phases: {[round(p, 2) for p in new_phases]}")
+            info["phases"] = new_phases
+            info["timeline"] = calculate_group_timeline(new_phases)
+            print(f"Timeline: {info['timeline']}")
+    
+    # Recalculate event times
+    recalculate_event_times(all_comm_events, group_info)
+    
+    return group_info
+
+def apply_TPE_and_update(all_comm_events, desired_time, job_allocations, group_info):
+    result = perform_TPE_for_time(all_comm_events, desired_time, job_allocations)
+    if result is not None:
+        pdp_matrix, normal_matrix, job_tor_map, max_comm_time, target_events = result
+        for evt in target_events:
+            g_id = evt["group"]
+            evt_index = evt["event_index"]
+            phases = group_info[g_id]["phases"]
+            phase_index = evt_index % len(phases)
+            # 更新phase为max_comm_time（若max_comm_time更大）
+            if max_comm_time > phases[phase_index]:
+                phases[phase_index] = max_comm_time
+
+        # 重新计算所有事件时间
+        #reassign_event_times(all_comm_events, group_info)
+
+        # 返回True表示TPE成功更新
+        return True
+    else:
+        print("No updates to communication events.")
+        return False
+
+def some_condition(evt):
+    # 根据您的实际逻辑对evt进行判断并返回True或False
+    return evt["group"] == 3  # 这只是示例逻辑
+
+def update_event_time(all_comm_events, group_info, target_events, max_comm_time):
+    """
+    根据 TPE 结果更新目标事件的时间。
+    """
+    for evt in target_events:
+        group_id = evt["group"]
+        event_index = evt["event_index"]
+        phases = group_info[group_id]["phases"]
+        phase_index = event_index % len(phases)
+        
+        # 更新当前阶段时间为最大通信时间（如果通信时间大于原阶段时间）
+        if max_comm_time > phases[phase_index]:
+            phases[phase_index] = max_comm_time
+        
+        print(f"Updated Group {group_id} Phase {phase_index} to {max_comm_time:.2f}")
+
+    # 重新计算所有事件时间
+    #reassign_event_times(all_comm_events, group_info)
+
+def print_batch_info(batch1, batch2, job_allocations):
+    """增强型辅助函数，用于打印批次信息，包含优化见解"""
+    print("  Batch 1 Jobs:")
+    for job in batch1:
+        ct_ratio = calculate_ct_ratio(job)
+        ratio_display = f"∞" if ct_ratio == float('inf') else f"{ct_ratio:.2f}"
+        print(f"    {job.job_key} (C/T Ratio: {ratio_display})")
+    
+    print("  Batch 2 Jobs:")
+    for job in batch2:
+        ct_ratio = calculate_ct_ratio(job)
+        ratio_display = f"∞" if ct_ratio == float('inf') else f"{ct_ratio:.2f}"
+        print(f"    {job.job_key} (C/T Ratio: {ratio_display})")
+    
+    # 计算并打印批次统计信息
+    if batch1:
+        batch1_compute = sum(sum(s['time'] for s in job.stages if s['type'] == 'compute') for job in batch1)
+        batch1_comm = sum(sum(s['data'] / 10e9 for s in job.stages if s['type'] == 'comm') for job in batch1)
+        print(f"  Batch 1 Stats: Total Compute={batch1_compute:.2f}s, Total Comm={batch1_comm:.2f}s")
+    
+    if batch2:
+        batch2_compute = sum(sum(s['time'] for s in job.stages if s['type'] == 'compute') for job in batch2)
+        batch2_comm = sum(sum(s['data'] / 10e9 for s in job.stages if s['type'] == 'comm') for job in batch2)
+        print(f"  Batch 2 Stats: Total Compute={batch2_compute:.2f}s, Total Comm={batch2_comm:.2f}s")
+    
+    # 评估潜在的重叠效率
+    if batch1 and batch2:
+        potential_overlap1 = min(batch1_compute, batch2_comm)
+        potential_overlap2 = min(batch2_compute, batch1_comm)
+        total_potential_overlap = potential_overlap1 + potential_overlap2
+        
+        total_time = batch1_compute + batch1_comm + batch2_compute + batch2_comm
+        overlap_percentage = (total_potential_overlap / total_time) * 100 if total_time > 0 else 0
+        
+        print(f"  Overlap Analysis: Potential overlap time={total_potential_overlap:.2f}s ({overlap_percentage:.1f}%)")
+    
+    print()  # 为可读性添加空行
+
+def print_job_details(job, job_allocations):
+    """增强型辅助函数，用于打印任务详细信息，包括C/T比"""
+    details = job_allocations[job.job_key]
+    print(f"  {job.job_key} ({details['job_type']})")
+    if details['job_type'] == "DML":
+        print(f"    Iterations: {details['iterations']}")
+    print(f"    Nodes: {', '.join(details['allocated_nodes'])}")
+    print(f"    Node IDs: {', '.join(map(str, details['allocated_node_ids']))}")
+    
+    compute_t = [s['time'] for s in details['stages'] if s['type'] == 'compute']
+    comm_d = [s['data'] for s in details['stages'] if s['type'] == 'comm']
+    comm_t = [d / 10e9 for d in comm_d]  # 以10Gbps转换数据大小为时间
+    
+    print(f"    Compute Times: {[round(t, 2) for t in compute_t]} seconds")
+    print(f"    Communication Data: {[round(d/1024, 2) for d in comm_d]} MB")
+    print(f"    Communication Times: {[round(t, 2) for t in comm_t]} seconds")
+    
+    # 计算并显示C/T比
+    ct_ratio = calculate_ct_ratio(job)
+    if ct_ratio == float('inf'):
+        print(f"    C/T Ratio: ∞ (No communication)")
+    else:
+        print(f"    C/T Ratio: {ct_ratio:.2f}")
+        
+    # 确定计算或通信主导
+    total_compute = sum(compute_t)
+    total_comm = sum(comm_t)
+    
+    if total_compute > total_comm:
+        dominance = f"Compute-dominant ({total_compute/total_comm:.1f}x)"
+    elif total_comm > total_compute:
+        dominance = f"Communication-dominant ({total_comm/total_compute:.1f}x)"
+    else:
+        dominance = "Balanced"
+        
+    print(f"    Dominance Profile: {dominance}")
+
+def process_sequential_TPE(all_comm_events, job_allocations, group_info, pdp_switch_count,
+                         normal_switch_count, nodes_per_tor, bandwidth, oxc_mapper):
+    print("\n===== 开始顺序TPE处理 =====")
+    """Process TPE events sequentially with timing statistics and job metrics tracking"""
+    events = sorted(all_comm_events, key=lambda x: x["time"])
+    print(f"事件总数: {len(events)}")
+
+    # 输出事件时间点摘要
+    event_times = sorted(set(evt["time"] for evt in events))
+    print(f"时间点: {event_times}")
+    
+    # Initialize trackers
+    tpe_stats = TPETimingStats()
+    job_comm_times = defaultdict(dict)
+    job_first_tor = {}  # Track first ToR assignment for each job
+    completed_jobs = set()  # 新增：跟踪已完成的任务
+    
+    # Track states
+    tor_assignments = {}  # {tor_id: {"type": "PDP/Normal", "assigned_nodes": set()}}
+    for i in range(1, pdp_switch_count + 1):
+        tor_assignments[i] = {"type": "PDP", "assigned_nodes": set()}
+    for i in range(pdp_switch_count + 1, pdp_switch_count + normal_switch_count + 1):
+        tor_assignments[i] = {"type": "Normal", "assigned_nodes": set()}
+        
+    active_connections = {}  # {job_key: {"nodes": [], "tor_id": int, "end_time": float}}
+    group_phase_times = {}  # {group_id: {"current_phase": int, "phase_end_times": []}}
+    
+    def find_available_tor(node_count, node_ids, job_key, phase_in_iteration):
+        """Find available ToR considering INC constraints"""
+        # Check if job had a previous ToR assignment for second communication phase
+        if phase_in_iteration in [2, 3] and job_key in job_first_tor:
+            return job_first_tor[job_key]
+            
+        # For first communication phase, try PDP ToRs first
+        for tor_id in range(1, pdp_switch_count + 1):
+            if len(tor_assignments[tor_id]["assigned_nodes"]) + node_count <= nodes_per_tor:
+                can_assign = True
+                for node in node_ids:
+                    for other_tor in tor_assignments.values():
+                        if node in other_tor["assigned_nodes"]:
+                            can_assign = False
+                            break
+                if can_assign:
+                    return tor_id
+                    
+        # Try Normal ToRs
+        for tor_id in range(pdp_switch_count + 1, pdp_switch_count + normal_switch_count + 1):
+            if len(tor_assignments[tor_id]["assigned_nodes"]) + node_count <= nodes_per_tor:
+                can_assign = True
+                for node in node_ids:
+                    for other_tor in tor_assignments.values():
+                        if node in other_tor["assigned_nodes"]:
+                            can_assign = False
+                            break
+                if can_assign:
+                    return tor_id
+        return None
+    
+    def adjust_pdp_metrics(job_key, tor_id, job_details):   
+        if tor_id <= pdp_switch_count:  # If PDP ToR
+            N = len(job_details["allocated_node_ids"])
+            #acceleration_factor = 1/N if N > 1 else 1
+            acceleration_factor = 1 if N > 1 else 1
+            
+            # Adjust second compute stage and communication data
+            if job_details["job_type"] == "DML":
+                job_details["stages"][2]["time"] *= acceleration_factor
+                job_details["stages"][3]["data"] *= acceleration_factor
+            elif job_details["job_type"] == "MapReduce":
+                job_details["stages"][3]["time"] *= acceleration_factor
+                job_details["stages"][2]["data"] *= acceleration_factor
+            
+            print(f"PDP adjustment for {job_key}: factor {acceleration_factor:.2f}")
+            return True
+        return False
+    
+    def assign_to_tor(job_key, node_ids, tor_id, end_time, phase_in_iteration):
+        """Assign nodes to a ToR with phase tracking"""
+        tor_assignments[tor_id]["assigned_nodes"].update(node_ids)
+        tor_type = tor_assignments[tor_id]["type"]
+        active_connections[job_key] = {
+            "nodes": node_ids,
+            "tor_id": tor_id,
+            "end_time": end_time
+        }
+         # 在应用PDP加速前先打印通信时间
+        job_details = job_allocations[job_key]
+        print(f"[DEBUG] Before PDP: {job_key} comm data: {[s['data'] for s in job_details['stages'] if s['type'] == 'comm']} MB")
+        
+        # Record first ToR assignment and apply PDP acceleration if applicable
+        if phase_in_iteration in [0, 1]:  # First communication phase
+            job_first_tor[job_key] = tor_id
+            if tor_id <= pdp_switch_count:
+                print(f"[DEBUG] Applying PDP acceleration to {job_key}")
+                adjust_pdp_metrics(job_key, tor_id, job_allocations[job_key])
+                
+        # 在应用PDP加速后再次打印通信时间        
+        print(f"[DEBUG] After PDP: {job_key} comm data: {[s['data'] for s in job_details['stages'] if s['type'] == 'comm']} MB")
+        
+        switch_name = f"ToR_{tor_id}({tor_type})"
+        print(f"Assigned Job {job_key} to {switch_name}")
+        return True
+
+    def clear_old_connections(current_time):
+        """Clear completed connections and update assignments"""
+        for job_key in list(active_connections.keys()):
+            if active_connections[job_key]["end_time"] <= current_time:
+                tor_id = active_connections[job_key]["tor_id"]
+                nodes = active_connections[job_key]["nodes"]
+                tor_assignments[tor_id]["assigned_nodes"].difference_update(nodes)
+                del active_connections[job_key]
+
+    def update_phase_time(group_id, phase_index, new_time, current_time):
+        """Update phase time and recalculate timelines"""
+        if group_id not in group_phase_times:
+            group_phase_times[group_id] = {
+                "current_phase": phase_index,
+                "phase_end_times": [0] * len(group_info[group_id]["phases"])
+            }
+            
+        phase_start = sum(group_info[group_id]["phases"][:phase_index])
+        current_phase_time = group_info[group_id]["phases"][phase_index]
+        
+        if new_time > current_phase_time:
+            print(f"Updating Group {group_id} Phase {phase_index} time from {current_phase_time:.2f} to {new_time:.2f}")
+            group_info[group_id]["phases"][phase_index] = new_time
+            
+        end_time = phase_start + group_info[group_id]["phases"][phase_index]
+        group_phase_times[group_id]["phase_end_times"][phase_index] = end_time
+        return end_time
+
+    def print_connections(current_time, oxc_mapper):
+        """Print current connection state and OXC mappings"""
+        print(f"\nConnections at time {current_time:.2f}:")
+        active_jobs = []
+        active_nodes = set()
+        for job_key, conn in active_connections.items():
+            tor_id = conn["tor_id"]
+            tor_type = tor_assignments[tor_id]["type"]
+            active_jobs.append(f"[{job_key}, {list(conn['nodes'])}, ToR_{tor_id}({tor_type})]")
+            active_nodes.update(conn["nodes"])
+        
+        for job in sorted(active_jobs):
+            print(job)
+            
+        print("\nOXC Port Mappings:")
+        for node_id in sorted(active_nodes):
+            tor_connection = oxc_mapper.get_node_connection(node_id)
+            if tor_connection:
+                tor_port, node_port, tor_id = tor_connection
+                print(f"Node {node_id}: ToR {tor_id} Port {tor_port} <-> OXC Port {node_port}")
+            else:
+                print(f"Node {node_id}: Not connected")
+
+    # 新增：检查任务是否应该完成
+    def check_job_completion(job_key, iteration, phase_in_iteration):
+        """检查任务是否完成所有迭代"""
+        job_type = job_allocations[job_key]["job_type"]
+        iterations = job_allocations[job_key].get("iterations", 1)
+    
+        # MapReduce任务只有一次迭代
+        if job_type == "MapReduce" and iteration == 0 and phase_in_iteration == 3:
+            return True
+    
+        # DML任务根据迭代次数判断
+        if job_type == "DML" and iteration == iterations - 1 and phase_in_iteration == 3:
+            return True
+    
+        return False
+
+    # Main processing loop
+    current_time = 0
+    while events:
+        current_events = [evt for evt in events if abs(evt["time"] - current_time) < 0.001]
+        if current_events:
+            event_start_time = time.time()
+            print(f"\nProcessing events at time {current_time:.2f}:")
+            
+            clear_old_connections(current_time)
+            
+            for event in current_events:
+                group_id = event["group"]
+                phase_index = event["event_index"]
+                iteration = event["iteration"]
+                phase_in_iteration = event["phase_in_iteration"]
+                print(f"Group {group_id} in phase {phase_in_iteration}, iteration {iteration}")
+                
+                # 过滤掉已完成的任务
+                filtered_jobs = []
+                for job_info in event["jobs"]:
+                    job_key = job_info["job_key"]
+                    if job_key not in completed_jobs:
+                        filtered_jobs.append(job_info)
+                    else:
+                        print(f"Skipping completed job {job_key}")
+                
+                event["jobs"] = filtered_jobs
+                if not event["jobs"]:
+                    print("No active jobs in this event after filtering.")
+                    continue
+                
+                event["jobs"].sort(key=lambda x: x["data"], reverse=True)
+                
+                for job_info in event["jobs"]:
+                    job_key = job_info["job_key"]
+                    node_ids = set(job_info["node_ids"])
+                    comm_data = job_info["data"]
+                    
+                    # Find available ToR considering INC constraints
+                    tor_id = find_available_tor(len(node_ids), node_ids, job_key, phase_in_iteration)
+                    
+                    if tor_id:
+                        # Calculate communication time with INC acceleration if applicable
+                        comm_time = comm_data / (bandwidth / 1e9)
+                        #comm_time = (comm_data * 8) / bandwidth  # MB转换为Mb，然后除以Gbps
+                        if tor_id <= pdp_switch_count and phase_in_iteration in [2, 3]:
+                            N = len(node_ids)
+                            #comm_time *= (1/N)
+                            comm_time *= (1)
+                        
+                        job_comm_times[job_key][phase_index] = comm_time
+                        
+                        # Update phase time and assign
+                        end_time = update_phase_time(group_id, phase_index, comm_time, current_time)
+                        assign_to_tor(job_key, node_ids, tor_id, end_time, phase_in_iteration)
+                        
+                        # 检查任务是否完成所有迭代
+                        if check_job_completion(job_key, iteration, phase_in_iteration):
+                            print(f"Job {job_key} has completed all iterations.")
+                            completed_jobs.add(job_key)
+                    else:
+                        print(f"Warning: Could not find available ToR for Job {job_key}")
+                
+                print_connections(current_time, oxc_mapper)
+            
+            event_duration = time.time() - event_start_time
+            tpe_stats.add_event_time(current_time, event_duration)
+            
+            # Update and remove processed events
+            for evt in events:
+                group_id = evt["group"]
+                phase_index = evt["event_index"]
+                evt["time"] = sum(group_info[group_id]["phases"][:phase_index])
+            
+            events = [evt for evt in events if abs(evt["time"] - current_time) >= 0.001]
+            
+            if events:
+                current_time = min(evt["time"] for evt in events)
+        else:
+            if events:
+                current_time = min(evt["time"] for evt in events)
+            else:
+                break
+
+    return group_info, job_comm_times, tpe_stats
+
+def get_phase_compute_time(group_info, phase_index):
+    """Get computation time for a specific phase"""
+    if phase_index >= len(group_info["phases"]):
+        return 0
+    return group_info["phases"][phase_index]
+
+def optimize_batches_hill_climbing(group):
+    print("\n===== 开始爬山算法优化批次分配 =====")
+    print(f"输入任务组: {[job.job_key for job in group]}")
+    """使用爬山算法优化批次分配以最大化资源利用率并最小化JCT"""
+    # 以C/T比率为基础的分配作为起点
+    best_batch1, best_batch2 = optimize_batches_by_ct_ratio(group)
+    print(f"初始批次1: {[job.job_key for job in best_batch1]}")
+    print(f"初始批次2: {[job.job_key for job in best_batch2]}")
+
+    best_metrics = evaluate_batch_allocation(best_batch1, best_batch2)
+    print(f"初始指标: {best_metrics}")
+    
+    max_iterations = min(100, 2**len(group))  # 为大型组限制迭代次数
+    iteration = 0
+    no_improvement_count = 0
+    
+    while iteration < max_iterations and no_improvement_count < 10:
+        print(f"\n迭代 {iteration+1}:")
+        improved = False
+        
+        # 尝试在批次间交换作业
+        for job1 in best_batch1:
+            for job2 in best_batch2:
+                # 创建交换作业后的新批次
+                new_batch1 = [j for j in best_batch1 if j != job1] + [job2]
+                new_batch2 = [j for j in best_batch2 if j != job2] + [job1]
+                
+                # 评估新分配
+                new_metrics = evaluate_batch_allocation(new_batch1, new_batch2)
+                
+                # 与最佳指标比较(优先考虑资源利用率，然后是JCT)
+                if is_better_allocation(new_metrics, best_metrics):
+                    print(f"改进! 交换 {job1.job_key} 和 {job2.job_key}")
+                    print(f"新指标: {new_metrics}")
+                    best_batch1, best_batch2 = new_batch1, new_batch2
+                    best_metrics = new_metrics
+                    improved = True
+        
+        # 如果批次不平衡，尝试移动单个作业
+        if len(best_batch1) > len(best_batch2) + 1:
+            for job in best_batch1:
+                new_batch1 = [j for j in best_batch1 if j != job]
+                new_batch2 = best_batch2 + [job]
+                
+                new_metrics = evaluate_batch_allocation(new_batch1, new_batch2)
+                if is_better_allocation(new_metrics, best_metrics):
+                    best_batch1, best_batch2 = new_batch1, new_batch2
+                    best_metrics = new_metrics
+                    improved = True
+        
+        elif len(best_batch2) > len(best_batch1) + 1:
+            for job in best_batch2:
+                new_batch1 = best_batch1 + [job]
+                new_batch2 = [j for j in best_batch2 if j != job]
+                
+                new_metrics = evaluate_batch_allocation(new_batch1, new_batch2)
+                if is_better_allocation(new_metrics, best_metrics):
+                    best_batch1, best_batch2 = new_batch1, new_batch2
+                    best_metrics = new_metrics
+                    improved = True
+        
+        if not improved:
+            no_improvement_count += 1
+        else:
+            no_improvement_count = 0
+            
+        iteration += 1
+    
+    print("\n优化完成:")
+    print(f"最终批次1: {[job.job_key for job in best_batch1]}")
+    print(f"最终批次2: {[job.job_key for job in best_batch2]}")
+    print(f"最终指标: {best_metrics}")
+    
+    return best_batch1, best_batch2
+
+def evaluate_batch_allocation(batch1, batch2):
+    """基于资源利用率和JCT评估批次分配的质量"""
+    # 计算每个批次的计算和通信时间
+    batch1_compute, batch1_comm = calculate_batch_times(batch1)
+    batch2_compute, batch2_comm = calculate_batch_times(batch2)
+    
+    # 计算每个批次的总执行时间
+    batch1_time = sum(batch1_compute) + sum(batch1_comm)
+    batch2_time = sum(batch2_compute) + sum(batch2_comm)
+    
+    # 估计总阶段时间(并行执行的最大值)
+    phase_times = []
+    phase_times.append(max(batch1_compute[0] if batch1_compute else 0, 
+                          batch2_comm[0] if batch2_comm else 0))
+    phase_times.append(max(batch2_compute[0] if batch2_compute else 0,
+                          batch1_comm[0] if batch1_comm else 0))
+    phase_times.append(max(batch1_compute[1] if len(batch1_compute) > 1 else 0,
+                          batch2_comm[1] if len(batch2_comm) > 1 else 0))
+    phase_times.append(max(batch2_compute[1] if len(batch2_compute) > 1 else 0,
+                          batch1_comm[1] if len(batch1_comm) > 1 else 0))
+    
+    total_phase_time = sum(phase_times)
+    
+    # 计算总作业时间(所有计算和通信时间之和)
+    total_job_time = sum(sum(job_compute_times(job)) + sum(job_comm_times(job)) 
+                          for job in batch1 + batch2)
+    
+    # 计算加权平均JCT
+    avg_jct = (batch1_time * len(batch1) + batch2_time * len(batch2)) / (len(batch1) + len(batch2))
+    
+    # 计算资源利用率(作业活动时间的百分比)
+    util = (total_job_time / ((len(batch1) + len(batch2)) * total_phase_time)) * 100
+    
+    # 计算重叠效率(越高越好)
+    potential_overlap = min(sum(batch1_compute), sum(batch2_comm)) + min(sum(batch2_compute), sum(batch1_comm))
+    overlap_efficiency = potential_overlap / total_phase_time if total_phase_time > 0 else 0
+    
+    # 计算负载平衡(越接近1越好)
+    load_balance = min(batch1_time, batch2_time) / max(batch1_time, batch2_time) if max(batch1_time, batch2_time) > 0 else 1
+    
+    return {
+        'util': util,
+        'jct': avg_jct,
+        'total_time': total_phase_time,
+        'overlap_efficiency': overlap_efficiency,
+        'load_balance': load_balance
+    }
+
+def is_better_allocation(new_metrics, best_metrics):
+    """确定新分配是否优于当前最佳分配"""
+    # 主要目标：最大化资源利用率，至少提高2%
+    util_improvement = new_metrics['util'] - best_metrics['util']
+    
+    # 次要目标：最小化JCT，至少提高5%
+    jct_improvement = (best_metrics['jct'] - new_metrics['jct']) / best_metrics['jct'] * 100
+    
+    # 如果利用率显著更好，则首选
+    if util_improvement >= 2:
+        return True
+    
+    # 如果利用率相似，检查JCT是否更好
+    if abs(util_improvement) < 2 and jct_improvement >= 5:
+        return True
+    
+    # 如果两个指标都更好(即使幅度很小)，则首选新分配
+    if util_improvement > 0 and jct_improvement > 0:
+        return True
+    
+    return False
+
+def calculate_batch_times(batch):
+    """计算批次的计算和通信时间"""
+    if not batch:
+        return [], []
+        
+    max_compute_times = []
+    max_comm_times = []
+    
+    for job in batch:
+        compute_times = [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+        comm_times = [stage['data'] / 10e9 for stage in job.stages if stage['type'] == 'comm']
+        
+        # 应用INC加速(1/N)
+        N = job.node_count
+        acceleration_factor = 1 if N > 1 else 1
+        
+        if job.job_type == "DML":
+            if len(compute_times) > 1:
+                compute_times[1] *= acceleration_factor
+            if len(comm_times) > 1:
+                comm_times[1] *= acceleration_factor
+        elif job.job_type == "MapReduce":
+            if len(compute_times) > 1:
+                compute_times[1] *= acceleration_factor
+            if len(comm_times) > 1:
+                comm_times[1] *= acceleration_factor
+        
+        # 更新最大时间
+        for i, t in enumerate(compute_times):
+            if i >= len(max_compute_times):
+                max_compute_times.append(t)
+            else:
+                max_compute_times[i] = max(max_compute_times[i], t)
+                
+        for i, t in enumerate(comm_times):
+            if i >= len(max_comm_times):
+                max_comm_times.append(t)
+            else:
+                max_comm_times[i] = max(max_comm_times[i], t)
+                
+    return max_compute_times, max_comm_times
+
+def job_compute_times(job):
+    """获取作业的计算时间"""
+    return [stage['time'] for stage in job.stages if stage['type'] == 'compute']
+
+def job_comm_times(job):
+    """获取作业的通信时间"""
+    return [stage['data'] / 10e9 for stage in job.stages if stage['type'] == 'comm']
+
+def main():
+    # 更新后的网络配置参数
+    tor_count = 32  # 32个ToR交换机
+    nodes_per_tor = 8  # 每个ToR连接8个计算节点
+    ports_per_tor = 8  # 每个ToR有8个下行链路
+    num_nodes = 256  # 总共256个计算节点
+    bandwidth = 10e9  # 带宽
+    over_subscription_ratio = 2  # 超额订阅比xp=2
+    pdp_switch_count = 16  # 16个PDP ToR
+    normal_switch_count = 16  # 16个普通ToR
+    
+    # 计算上行链路数量
+    uplinks_per_tor = int(ports_per_tor / over_subscription_ratio)  # 每个ToR有4条上行链路
+    uplinks_per_agg = uplinks_per_tor  # 每个Agg有4条上行链路连接Core
+    
+    # 创建作业
+    num_jobs = 6
+    K = 2
+    time_threshold = 2
+
+    jobs = []
+    for i in range(num_jobs):
+        job_type = random.choice(["DML", "MapReduce"])
+        node_count = random.randint(2, 8)  # 减小节点请求范围
+        job = Job(job_type, node_count)
+        job.job_key = f"Job_{i+1}"
+        print(f"[DEBUG] Job {job.job_key} stages data: {[s['data'] for s in job.stages if s['type'] == 'comm']} MB")
+        jobs.append(job)
+
+    # 创建包含OXC层的网络拓扑
+    topology, node_ids, agg_switches, core_switches, oxc_mapper = create_network_topology(
+        tor_count, nodes_per_tor, ports_per_tor, num_nodes, over_subscription_ratio
+    )
+    
+    # 跟踪已分配的节点
+    used_nodes = set()
+    job_allocations = {}
+    for job in jobs:
+        allocated_nodes = allocate_nodes_to_job(job, topology, used_nodes, oxc_mapper)
+        allocated_node_ids = [node_ids[n] for n in allocated_nodes]
+        job_allocations[job.job_key] = {
+            "job_type": job.job_type,
+            "node_count": job.node_count,
+            "allocated_nodes": allocated_nodes,
+            "allocated_node_ids": allocated_node_ids,
+            "stages": job.stages,
+            "iterations": job.iterations
+        }
+        job.allocated_node_ids = allocated_node_ids
+    
+    start_time = time.time()
+
+    # 对作业进行分组
+    grouped_jobs = cluster_jobs(jobs, K)
+    all_group_sets = [(grouped_jobs, "Multi-Iter")]
+    all_comm_events = []
+    group_info = {}
+    group_counter = 1
+
+    # 处理每个分组并生成通信事件
+    print("\n=== Job Groups ===")
+    for g_idx, group in enumerate(grouped_jobs, 1):
+        # 使用优化的批次分配算法
+        base_phases, batch1, batch2 = calculate_group_stages(group)
+        max_iter = max([job_allocations[job.job_key]['iterations'] 
+                       if job_allocations[job.job_key]['job_type'] == "DML" else 1 
+                       for job in group])
+        
+        # 使用修改后的函数来计算所有迭代的相位
+        if max_iter > 1:
+            phases = repeat_phases_for_iterations(base_phases, group, job_allocations, max_iter)
+        else:
+            phases = base_phases
+
+        group_info[g_idx] = {
+            "phases": phases[:],
+            "timeline": [],
+            "batch1": batch1,
+            "batch2": batch2,
+            "iterations": max_iter
+        }
+
+        # 打印组信息
+        print(f"Group {g_idx}: Initial Phases - {[round(p, 2) for p in phases]}")
+        print("\nOptimized Batch Distribution:")
+        print_batch_info(batch1, batch2, job_allocations)
+
+        print("\nDetailed Job Information:")
+        for job in batch1 + batch2:
+            print_job_details(job, job_allocations) 
+
+        # 生成通信事件
+        events, _ = generate_comm_events_for_group(group, phases, batch1, batch2, 
+                                                 job_allocations, g_idx)
+        all_comm_events.extend(events)
+
+     # Process TPE first
+    print("\nStarting sequential TPE processing...")
+    updated_group_info, job_comm_times, tpe_stats = process_sequential_TPE(
+        all_comm_events, job_allocations, group_info,
+        pdp_switch_count, normal_switch_count,
+        nodes_per_tor, bandwidth, oxc_mapper
+    )
+    
+    # Print final results
+    print("\nFinal Results after Sequential TPE Processing:")
+    for g_id, info in sorted(updated_group_info.items()):
+        print(f"\nGroup {g_id}:")
+        print(f"Final Phases: {[round(p, 2) for p in info['phases']]}")
+        total_time = sum(info['phases'])
+        print(f"Total Execution Time: {total_time:.2f}")
+
+    # Calculate average metrics after TPE processing
+    avg_jct, avg_resource_util, job_metrics = calculate_average_metrics(
+        job_allocations, updated_group_info, job_comm_times
+    )
+
+    # Print job metrics
+    print("\nJob Metrics:")
+    for job_key, job_info in job_allocations.items():
+        group_id = None
+        # Find which group the job belongs to
+        for g_id, g_info in updated_group_info.items():
+            if any(j.job_key == job_key for j in g_info["batch1"] + g_info["batch2"]):
+                group_id = g_id
+                break
+        
+        if group_id:
+            metrics = calculate_job_metrics(
+                job_key, job_info, updated_group_info, group_id, job_comm_times
+            )
+            
+            print(f"\n{job_key} ({job_info['job_type']}):")
+            print(f"  Compute Times: {[round(t, 2) for t in metrics.compute_times]}")
+            print(f"  Communication Times: {[round(t, 2) for t in metrics.communication_times]}")
+            print(f"  JCT: {metrics.jct:.2f}")
+            print(f"  Group Total Time: {metrics.group_total_time:.2f}")
+            print(f"  Idle Time: {metrics.idle_time:.2f}")
+            print(f"  Resource Utilization: {metrics.resource_utilization:.2f}%")
+
+    # Print network topology information
+    print("\nNetwork Topology Details:")
+    print(f"ToR Switches: {tor_count}")
+    print(f"Aggregation Switches: {len(agg_switches)}")
+    print(f"Core Switches: {len(core_switches)}")
+    print(f"Compute Nodes: {num_nodes}")
+    print(f"OXC Size: 256×256")
+    print(f"Over-subscription Ratio: {over_subscription_ratio}")
+    print(f"ToR Downlinks: {ports_per_tor}")
+    print(f"ToR Uplinks: {uplinks_per_tor}")
+    print(f"Agg Downlinks: {uplinks_per_tor}")
+    print(f"Agg Uplinks: {uplinks_per_agg}")
+    
+    # Print OXC connection statistics
+    print("\nOXC Connection Statistics:")
+    total_connections = len(oxc_mapper.oxc_port_mappings)
+    print(f"Total active connections: {total_connections}")
+    print(f"ToR to OXC ports used: {total_connections}/{oxc_mapper.tor_port_end}")
+    print(f"Node to OXC ports used: {total_connections}/{num_nodes}")
+
+    # Print overall system metrics
+    print("\nOverall System Metrics:")
+    print(f"Average Job Completion Time (JCT): {avg_jct:.2f} seconds")
+    print(f"Average Resource Utilization: {avg_resource_util:.2f}%")
+
+    # Print TPE timing statistics
+    print("\nTPE Timing Statistics:")
+    print(f"Total TPE Events Processed: {tpe_stats.event_count}")
+    print(f"Average TPE Processing Time: {tpe_stats.get_average_time():.4f} seconds")
+    print("\nTPE Processing Times by Time Point:")
+    for time_point, duration in sorted(tpe_stats.event_times.items()):
+        print(f"Time {time_point:.2f}: {duration:.4f} seconds")
+
+    end_time = time.time()
+    print(f"\nTotal execution time: {end_time - start_time:.4f} seconds")
+
+if __name__ == "__main__":
+    main()
